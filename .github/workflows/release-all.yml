@@ -1,0 +1,377 @@
+name: Release All Platforms
+
+on:
+  release:
+    types: [ published ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag'
+        required: true
+        default: '1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-all:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows builds
+          - platform: windows/amd64
+            os: windows-latest
+            arch: x64
+          - platform: windows/arm64
+            os: windows-latest
+            arch: arm64
+          # macOS builds
+          - platform: darwin/amd64
+            os: macos-latest
+            arch: intel
+          - platform: darwin/arm64
+            os: macos-latest
+            arch: arm64
+          - platform: darwin/universal
+            os: macos-latest
+            arch: universal
+          # Linux builds
+          - platform: linux/amd64
+            os: ubuntu-latest
+            arch: amd64
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Normalise platform tag
+        id: normalise_platform
+        shell: bash
+        run: |
+          tag=$(echo ${{ matrix.platform }} | sed -e 's/\//_/g')
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Normalise version tag
+        id: normalise_version
+        shell: bash
+        run: |
+          if [ "${{ github.event.release.tag_name }}" == "" ]; then
+            raw_version="${{ github.event.inputs.tag }}"
+          else
+            raw_version="${{ github.event.release.tag_name }}"
+          fi
+          
+          # Remove 'v' prefix if present
+          version=$(echo "$raw_version" | sed -e 's/^v//g')
+          
+          # Ensure version starts with a digit for DEB compatibility
+          if [[ ! "$version" =~ ^[0-9] ]]; then
+            version="0.$version"
+          fi
+          
+          # Create RPM-compatible version (replace hyphens with dots)
+          rpm_version=$(echo "$version" | sed 's/-/./g')
+          
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "rpm_version=$rpm_version" >> "$GITHUB_OUTPUT"
+          echo "Normalized version: $version"
+          echo "RPM version: $rpm_version"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install Wails
+        shell: bash
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
+
+      # Platform-specific dependency installation
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          echo "Installing Windows dependencies..."
+          choco install nsis jq --no-progress --yes
+          echo "Dependencies installed successfully"
+          
+          # Add NSIS to PATH
+          echo "C:\Program Files (x86)\NSIS" >> $GITHUB_PATH
+          echo "Verifying NSIS installation..."
+          ls -la "C:\Program Files (x86)\NSIS" || echo "NSIS not found in expected location"
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install jq
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev jq rpm
+          
+          # Create symlink to make webkit2gtk-4.0 available for Wails
+          sudo mkdir -p /usr/lib/x86_64-linux-gnu/pkgconfig
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/pkgconfig/webkit2gtk-4.1.pc /usr/lib/x86_64-linux-gnu/pkgconfig/webkit2gtk-4.0.pc
+          
+          # Also create symlinks for the library files
+          sudo find /usr/lib/x86_64-linux-gnu -name "*webkit2gtk-4.1*" -exec bash -c 'sudo ln -sf "$1" "${1//4.1/4.0}"' _ {} \;
+
+      - name: Update version in project files
+        shell: bash
+        run: |
+          jq '.info.productVersion = "${{ steps.normalise_version.outputs.version }}"' wails.json > tmp.json
+          mv tmp.json wails.json
+          cd frontend
+          jq '.version = "${{ steps.normalise_version.outputs.version }}"' package.json > tmp.json
+          mv tmp.json package.json
+          npm install
+
+      # Windows builds
+      - name: Debug Windows environment
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "=== Environment Check ==="
+          go version
+          wails version
+          echo "Platform: ${{ matrix.platform }}"
+          echo "Version: ${{ steps.normalise_version.outputs.version }}"
+          echo "=== Pre-build directory ==="
+          ls -la build/ || echo "No build directory"
+          
+      - name: Build Windows portable
+        if: runner.os == 'Windows'
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          echo "=== Starting Windows portable build ==="
+          echo "Platform: ${{ matrix.platform }}"
+          echo "Version: ${{ steps.normalise_version.outputs.version }}"
+          
+          # Set environment variables for better error handling
+          export CGO_ENABLED=1
+          export GOOS=windows
+          
+          # Build with verbose output
+          wails build -clean -platform ${{ matrix.platform }} \
+          -webview2 embed \
+          -ldflags "-X main.version=v${{ steps.normalise_version.outputs.version }}"
+          
+          echo "=== Build completed, checking output ==="
+          ls -la build/bin/ || echo "No build/bin directory found"
+          
+          # Verify the executable was created
+          if [ ! -f "build/bin/download-manager.exe" ]; then
+            echo "ERROR: Executable not found!"
+            exit 1
+          fi
+
+      - name: Compress Windows portable
+        if: runner.os == 'Windows'
+        working-directory: ./build/bin
+        run: Compress-Archive "download-manager.exe" "DownloadManager_Portable_${{ steps.normalise_version.outputs.version }}_${{ steps.normalise_platform.outputs.tag }}.zip"
+
+      - name: Build Windows NSIS installer
+        if: runner.os == 'Windows'
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          echo "=== Starting Windows NSIS installer build ==="
+          
+          # Set environment variables
+          export CGO_ENABLED=1
+          export GOOS=windows
+          
+          # Build NSIS installer (no -clean to preserve portable ZIP)
+          wails build -platform ${{ matrix.platform }} \
+          -nsis -webview2 embed \
+          -ldflags "-X main.version=v${{ steps.normalise_version.outputs.version }}"
+          
+          echo "=== NSIS build completed, checking output ==="
+          ls -la build/bin/ || echo "No build/bin directory found"
+
+      - name: Rename Windows installer
+        if: runner.os == 'Windows'
+        working-directory: ./build/bin
+        shell: powershell
+        run: |
+          $installerFile = Get-ChildItem -Name "*installer*.exe", "*setup*.exe", "*-installer.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($installerFile) {
+            Rename-Item -Path $installerFile -NewName "DownloadManager_Setup_${{ steps.normalise_version.outputs.version }}_${{ steps.normalise_platform.outputs.tag }}.exe"
+          }
+
+      # macOS builds
+      - name: Build macOS app
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          CGO_ENABLED=1 wails build -clean -platform ${{ matrix.platform }} \
+          -ldflags "-X main.version=v${{ steps.normalise_version.outputs.version }}"
+
+      - name: Compress macOS app
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cd build/bin
+          tar -czf DownloadManager_${{ steps.normalise_version.outputs.version }}_mac_${{ matrix.arch }}.tar.gz download-manager.app
+
+      # Linux builds
+      - name: Build Linux app
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          CGO_ENABLED=1 wails build -clean -platform ${{ matrix.platform }} \
+          -ldflags "-X main.version=v${{ steps.normalise_version.outputs.version }}"
+
+      - name: Create Linux desktop file
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p build/linux
+          cat > build/linux/download-manager.desktop << EOF
+          [Desktop Entry]
+          Name=Download Manager
+          Comment=A modern download manager application
+          Exec=/usr/bin/download-manager
+          Icon=download-manager
+          Terminal=false
+          Type=Application
+          Categories=Network;
+          EOF
+
+      - name: Build Linux DEB package
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # Create DEB package structure
+          mkdir -p build/deb/DEBIAN
+          mkdir -p build/deb/usr/bin
+          mkdir -p build/deb/usr/share/applications
+          
+          # Copy files
+          cp build/bin/download-manager build/deb/usr/bin/
+          cp build/linux/download-manager.desktop build/deb/usr/share/applications/
+          
+          # Create control file
+          cat > build/deb/DEBIAN/control << EOF
+          Package: download-manager
+          Version: ${{ steps.normalise_version.outputs.version }}
+          Section: net
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Mohammad Jamshidian <jamshidian9898@gmail.com>
+          Description: A modern download manager application
+           Download Manager is a modern, efficient download manager built with Wails and Vue.js.
+          Depends: libgtk-3-0, libwebkit2gtk-4.0-37
+          EOF
+          
+          # Build DEB package
+          dpkg-deb --build build/deb build/bin/download-manager_${{ steps.normalise_version.outputs.version }}_${{ steps.normalise_platform.outputs.tag }}.deb
+
+      - name: Build Linux RPM package
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # Create RPM build structure
+          mkdir -p build/rpm/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          mkdir -p build/rpm/SOURCES/download-manager-${{ steps.normalise_version.outputs.rpm_version }}/usr/bin
+          mkdir -p build/rpm/SOURCES/download-manager-${{ steps.normalise_version.outputs.rpm_version }}/usr/share/applications
+          
+          # Copy files
+          cp build/bin/download-manager build/rpm/SOURCES/download-manager-${{ steps.normalise_version.outputs.rpm_version }}/usr/bin/
+          cp build/linux/download-manager.desktop build/rpm/SOURCES/download-manager-${{ steps.normalise_version.outputs.rpm_version }}/usr/share/applications/
+          
+          # Create tarball
+          cd build/rpm/SOURCES
+          tar -czf download-manager-${{ steps.normalise_version.outputs.rpm_version }}.tar.gz download-manager-${{ steps.normalise_version.outputs.rpm_version }}/
+          cd ../../..
+          
+          # Create spec file
+          cat > build/rpm/SPECS/download-manager.spec << EOF
+          Name: download-manager
+          Version: ${{ steps.normalise_version.outputs.rpm_version }}
+          Release: 1%{?dist}
+          Summary: A modern download manager application
+          License: MIT
+          Source0: %{name}-%{version}.tar.gz
+          BuildArch: x86_64
+          Requires: gtk3, webkit2gtk3
+          
+          %description
+          Download Manager is a modern, efficient download manager built with Wails and Vue.js.
+          
+          %prep
+          %setup -q
+          
+          %install
+          mkdir -p %{buildroot}/usr/bin
+          mkdir -p %{buildroot}/usr/share/applications
+          cp usr/bin/download-manager %{buildroot}/usr/bin/
+          cp usr/share/applications/download-manager.desktop %{buildroot}/usr/share/applications/
+          
+          %files
+          /usr/bin/download-manager
+          /usr/share/applications/download-manager.desktop
+          
+          %changelog
+          * $(date +'%a %b %d %Y') Mohammad Jamshidian <jamshidian9898@gmail.com> - ${{ steps.normalise_version.outputs.rpm_version }}-1
+          - Release ${{ steps.normalise_version.outputs.rpm_version }}
+          EOF
+          
+          # Build RPM
+          rpmbuild --define "_topdir $(pwd)/build/rpm" -ba build/rpm/SPECS/download-manager.spec
+          cp build/rpm/RPMS/*/download-manager-*.rpm build/bin/download-manager_${{ steps.normalise_version.outputs.version }}_${{ steps.normalise_platform.outputs.tag }}.rpm
+
+      - name: Create Linux TAR.XZ archive
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cd build/bin
+          tar -cJf download-manager_${{ steps.normalise_version.outputs.version }}_${{ steps.normalise_platform.outputs.tag }}.tar.xz download-manager
+
+      # Upload all assets to the SAME release
+      - name: Upload Windows assets
+        if: runner.os == 'Windows'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+          files: |
+            ./build/bin/DownloadManager_Portable_${{ steps.normalise_version.outputs.version }}_${{ steps.normalise_platform.outputs.tag }}.zip
+            ./build/bin/DownloadManager_Setup_${{ steps.normalise_version.outputs.version }}_${{ steps.normalise_platform.outputs.tag }}.exe
+          token: ${{ secrets.GITHUB_TOKEN }}
+          append_body: false
+          make_latest: false
+
+      - name: Upload macOS assets
+        if: runner.os == 'macOS'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+          files: ./build/bin/DownloadManager_${{ steps.normalise_version.outputs.version }}_mac_${{ matrix.arch }}.tar.gz
+          token: ${{ secrets.GITHUB_TOKEN }}
+          append_body: false
+          make_latest: false
+
+      - name: Upload Linux assets
+        if: runner.os == 'Linux'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+          files: |
+            ./build/bin/download-manager_${{ steps.normalise_version.outputs.version }}_${{ steps.normalise_platform.outputs.tag }}.deb
+            ./build/bin/download-manager_${{ steps.normalise_version.outputs.version }}_${{ steps.normalise_platform.outputs.tag }}.rpm
+            ./build/bin/download-manager_${{ steps.normalise_version.outputs.version }}_${{ steps.normalise_platform.outputs.tag }}.tar.xz
+          token: ${{ secrets.GITHUB_TOKEN }}
+          append_body: false
+          make_latest: false

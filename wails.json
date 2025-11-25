@@ -9,5 +9,25 @@
   "author": {
     "name": "Mohammad Jamshidian",
     "email": "jamshidian9898@gmail.com"
+  },
+  "info": {
+    "companyName": "Mohammad Jamshidian",
+    "productName": "Download Manager",
+    "productVersion": "1.0.0",
+    "copyright": "Copyright © 2024 Mohammad Jamshidian. All rights reserved.",
+    "comments": "A modern download manager application built with Wails"
+  },
+  "nsis": {
+    "languages": ["English"],
+    "displayName": "Download Manager",
+    "description": "A modern download manager application",
+    "publisher": "Mohammad Jamshidian",
+    "homepage": "https://github.com/jamshidian/download-manager",
+    "license": "LICENSE",
+    "allowDowngrades": true,
+    "allowDirSelection": true,
+    "allowStartMenuCreation": true,
+    "allowDesktopCreation": true,
+    "createAppUserModelID": true
   }
 }
