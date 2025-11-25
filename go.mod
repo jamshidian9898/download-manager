@@ -1,4 +1,4 @@
-module download-manager
+module github.com/jamshidian/download-manager
 
 go 1.23
 

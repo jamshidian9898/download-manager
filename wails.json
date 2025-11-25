@@ -17,6 +17,15 @@
     "copyright": "Copyright © 2024 Mohammad Jamshidian. All rights reserved.",
     "comments": "A modern download manager application built with Wails"
   },
+  "build": {
+    "darwin": {
+      "entitlements": "build/darwin/entitlements.plist",
+      "provisioningProfile": "",
+      "sign": false,
+      "hardened": false,
+      "notarize": false
+    }
+  },
   "nsis": {
     "languages": ["English"],
     "displayName": "Download Manager",

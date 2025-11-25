@@ -1,0 +1,5 @@
+- wails doctor
+- wails dev
+- wails build # build for macos
+- wails build -platform windows/amd64 # build for windows arm64
+- 
